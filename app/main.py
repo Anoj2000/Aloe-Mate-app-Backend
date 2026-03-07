@@ -19,6 +19,11 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    return {"message": "Aloe Hybrid Maturity API is running"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -48,8 +53,6 @@ async def predict(
     cnn_cls, cnn_conf = predict_cnn(cnn_bytes)
 
     # ── Fusion ────────────────────────────────────────────────────────────────
-    # Returns one of: IMMATURE | INTERMEDIATE | MATURE | NON_ALOE
-    # low_confidence = True when CNN conf <= 0.65 OR Geo conf <= 0.65
     result = fuse_decision_tree(
         cnn=Out(cnn_cls, float(cnn_conf)),
         geo=Out(geo_cls, float(geo_conf)),
