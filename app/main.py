@@ -109,11 +109,11 @@ async def predict(
     geo_cls  = geo_class_from_area(area)
     geo_conf = geo_confidence(area)
 
-    # ── CNN branch ────────────────────────────────────────────────────────────
+    # ── CNN branch 
     cnn_bytes         = await cnn_image.read()
     cnn_cls, cnn_conf = predict_cnn(cnn_bytes)
 
-    # ── Fusion ────────────────────────────────────────────────────────────────
+    # ── Fusion 
     result = fuse_decision_tree(
         cnn=Out(cnn_cls, float(cnn_conf)),
         geo=Out(geo_cls, float(geo_conf)),
