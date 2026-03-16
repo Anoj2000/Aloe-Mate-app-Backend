@@ -1,6 +1,6 @@
 """
 Geo algorithm — area-based maturity classification.
-Thresholds and logic are unchanged from the original.
+Thresholds are the original calibrated values — do not change them.
 
 IMPORTANT: Always pass EXIF-corrected dimensions to geo_area_px2().
 Use get_exif_aware_dims() in main.py before calling this function.
@@ -18,9 +18,8 @@ def geo_area_px2(roi_r: float, img_w: int, img_h: int) -> float:
     Compute the plant area in pixels² from the normalised ROI radius.
 
     roi_r is normalised to min(visual_width, visual_height) by the frontend.
-    img_w and img_h MUST be the EXIF-corrected visual dimensions — i.e.
-    the dimensions after applying any EXIF rotation tag. Use
-    get_exif_aware_dims() in main.py to obtain these values.
+    img_w and img_h MUST be EXIF-corrected visual dimensions.
+    Use get_exif_aware_dims() in main.py to obtain these values.
 
     Formula:
         radius_px = roi_r * min(img_w, img_h)
