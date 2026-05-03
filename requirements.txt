@@ -3,7 +3,7 @@ uvicorn==0.30.6
 python-multipart==0.0.9
 pydantic==2.8.2
 pillow==10.4.0
-numpy==2.0.1
-torch==2.5.1+cpu
-torchvision==0.20.1+cpu
+numpy==1.26.4
+torch==2.5.1
+torchvision==0.20.1
 python-dateutil==2.9.0
