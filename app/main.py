@@ -1,12 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ExifTags
+from datetime import date
+from dateutil.relativedelta import relativedelta
 import io
 
 from .schemas   import PredictResponse, ROI
 from .geo       import geo_area_px2, geo_class_from_area, geo_confidence
 from .cnn.model import predict_cnn
-from .fusion    import fuse_decision_tree, Out
 
 app = FastAPI(title="Aloe Hybrid Maturity API")
 
@@ -18,6 +19,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── EXIF helper ───────────────────────────────────────────────────────────────
 
 def get_exif_aware_dims(pil_image: Image.Image) -> tuple[int, int]:
     """
@@ -61,6 +64,8 @@ def get_exif_aware_dims(pil_image: Image.Image) -> tuple[int, int]:
         return raw_w, raw_h                  # safe fallback — never crash
 
 
+# ── Health endpoints ───────────────────────────────────────────────────────────
+
 @app.get("/")
 def root():
     return {"message": "Aloe Hybrid Maturity API is running"}
@@ -71,6 +76,8 @@ def health():
     return {"status": "ok"}
 
 
+# ── Predict endpoint ───────────────────────────────────────────────────────────
+
 @app.post("/predict", response_model=PredictResponse)
 async def predict(
     cnn_image: UploadFile = File(...),
@@ -78,50 +85,65 @@ async def predict(
     roi_x:     float      = Form(...),
     roi_y:     float      = Form(...),
     roi_r:     float      = Form(...),
-    plant_age: int        = Form(3),
 ):
     roi_obj = ROI(x=roi_x, y=roi_y, r=roi_r)
 
-    # ── GEO branch ────────────────────────────────────────────────────────────
+    # ── Step 1: CNN branch (always runs first) ────────────────────────────────
+    cnn_bytes         = await cnn_image.read()
+    cnn_cls, cnn_conf = predict_cnn(cnn_bytes)
+
+    # ── Step 2: Validation gate ───────────────────────────────────────────────
+    # If CNN identifies NON_ALOE, skip Geo entirely and return immediately.
+    if cnn_cls == "NON_ALOE":
+        return {
+            "is_aloe_vera":     False,
+            "cnn_model": {
+                "predicted_class": cnn_cls,
+                "confidence":      float(cnn_conf),
+            },
+            "geo_algorithm":    None,
+            "classes_match":    False,
+            "harvest_required": False,
+            "harvest_message":  None,
+        }
+
+    # ── Step 3: GEO branch (only runs when CNN confirms aloe vera) ────────────
     geo_bytes = await geo_image.read()
 
     # Open BEFORE convert("RGB") so EXIF data is still intact for dim extraction.
     geo_pil_raw = Image.open(io.BytesIO(geo_bytes))
 
-    # ✅ FIXED: read visual dimensions from EXIF-aware helper BEFORE converting.
-    # The old code did:
-    #   geo_pil = Image.open(...).convert("RGB")  ← strips EXIF
-    #   w, h    = geo_pil.size                    ← raw buffer dims, wrong for
-    #                                                portrait gallery photos
-    # For a portrait iPhone photo the buffer is 4032×3024 (landscape) with
-    # EXIF orientation=6. The old code passed w=4032, h=3024 to geo_area_px2,
-    # giving min_dim=3024 when it should be 3024 — this case happens to be the
-    # same, BUT for orientation=8 (rotate 270°) and some Android cameras the
-    # swap goes the other way and min_dim resolves to the wrong axis entirely,
-    # making the computed area jump by up to (long/short)² ≈ 1.78×, which
-    # easily crosses the T1/T2 thresholds and produces the wrong maturity class.
+    # Read visual dimensions from EXIF-aware helper BEFORE converting.
+    # Gallery photos stored as landscape buffers (e.g. 4032×3024) with EXIF
+    # orientation=6 must be swapped here so the Geo area formula uses the
+    # correct visual short-side as the normalisation base.
     w, h = get_exif_aware_dims(geo_pil_raw)
 
     # Now safe to convert for any downstream pixel processing if needed.
-    geo_pil = geo_pil_raw.convert("RGB")
+    geo_pil = geo_pil_raw.convert("RGB")  # noqa: F841 (kept for future use)
 
     area     = geo_area_px2(roi_obj.r, w, h)
     geo_cls  = geo_class_from_area(area)
     geo_conf = geo_confidence(area)
 
-    # ── CNN branch 
-    cnn_bytes         = await cnn_image.read()
-    cnn_cls, cnn_conf = predict_cnn(cnn_bytes)
+    print("====== GEO ALGORITHM DEBUG ======")
+    print(f"PIL Raw size (w, h) : {geo_pil_raw.size}")
+    print(f"EXIF Aware (w, h)   : {(w, h)}")
+    print(f"Frontend roi_r      : {roi_obj.r}")
+    print(f"Calculated Area (px): {area}")
+    print(f"Predicted Class     : {geo_cls}")
+    print("=================================")
 
-    # ── Fusion 
-    result = fuse_decision_tree(
-        cnn=Out(cnn_cls, float(cnn_conf)),
-        geo=Out(geo_cls, float(geo_conf)),
-        geo_area_px2=area,
-        age_months=int(plant_age),
+    # ── Step 4: Compare CNN and Geo outputs separately ───────────────────────
+    classes_match    = (cnn_cls == geo_cls)
+    harvest_required = classes_match and cnn_cls == "MATURE"
+    harvest_message: str | None = (
+        "Ready to harvest! Best time: Morning or Evening"
+        if harvest_required else None
     )
 
     return {
+        "is_aloe_vera":     True,
         "cnn_model": {
             "predicted_class": cnn_cls,
             "confidence":      float(cnn_conf),
@@ -131,10 +153,7 @@ async def predict(
             "predicted_class": geo_cls,
             "confidence":      float(geo_conf),
         },
-        "ensemble_prediction": {
-            "predicted_class": result.cls,
-            "confidence":      float(result.conf),
-            "decision_reason": result.reason,
-            "low_confidence":  result.low_confidence,
-        },
+        "classes_match":    classes_match,
+        "harvest_required": harvest_required,
+        "harvest_message":  harvest_message,
     }

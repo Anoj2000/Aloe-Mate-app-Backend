@@ -7,7 +7,7 @@ import logging
 import threading
 from typing import List, Tuple
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -125,31 +125,16 @@ def _build_transform(img_w: int, img_h: int):
     Build inference transform that matches the training val_transform exactly:
         Resize((224,224)) -> ToTensor() -> Normalize(ImageNet mean/std)
 
-    Smart resize to avoid unnecessary upscaling:
-        224x224 input  -> skip resize (already correct, frontend sent exact size)
-        > 512px input  -> two-step: Resize(256) -> Resize(224)  [anti-aliasing]
-        other          -> single Resize(224)
+    Now performs a CenterCrop on the shortest side to maintain a 1:1 aspect ratio,
+    since the frontend no longer crops the image itself.
     """
     import torchvision.transforms as T
 
     norm = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-    if img_w == 224 and img_h == 224:
-        # Frontend already sent 224x224 — just normalise, no spatial change
-        return T.Compose([T.ToTensor(), norm])
-
-    if max(img_w, img_h) > 512:
-        # High-res photo: two-step downscale reduces aliasing
-        return T.Compose([
-            T.Resize(256, interpolation=T.InterpolationMode.BILINEAR),
-            T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.BILINEAR),
-            T.ToTensor(),
-            norm,
-        ])
-
-    # Medium-res: single resize step
     return T.Compose([
-        T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.BILINEAR),
+        T.Resize(256, interpolation=T.InterpolationMode.BILINEAR, antialias=True),
+        T.CenterCrop(224),
         T.ToTensor(),
         norm,
     ])
@@ -170,12 +155,16 @@ def predict_cnn(image_bytes: bytes) -> Tuple[str, float]:
 
     try:
         device       = _get_device()
-        img          = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        raw_img      = Image.open(io.BytesIO(image_bytes))
+        # FIX: Apply EXIF rotation before converting to RGB.
+        img          = ImageOps.exif_transpose(raw_img).convert("RGB")
         img_w, img_h = img.size
         logger.info(f"Input image size: {img_w}x{img_h}")
 
         transform    = _build_transform(img_w, img_h)
         tensor       = transform(img).unsqueeze(0).to(device)   # (1, 3, 224, 224)
+
+        # Prediction
 
         model.eval()
         with torch.no_grad():
@@ -184,15 +173,44 @@ def predict_cnn(image_bytes: bytes) -> Tuple[str, float]:
                 logits = logits[0]
             probs = torch.nn.functional.softmax(logits[0], dim=0)
 
-        probs_np   = probs.cpu().numpy()
-        pred_idx   = int(probs_np.argmax())
-        confidence = float(probs_np[pred_idx])
+        probs_np = probs.cpu().numpy()
+        classes  = _get_classes()
+        
+        # ── Two-stage classification + threshold ──
+        NON_ALOE_THRESHOLD = 0.50
+        UNCERTAINTY_THRESHOLD = 0.35
 
-        classes = _get_classes()
-        label   = classes[pred_idx] if pred_idx < len(classes) else f"UNKNOWN_{pred_idx}"
+        try:
+            non_aloe_idx = classes.index("NON_ALOE")
+        except ValueError:
+            # Fallback if NON_ALOE is missing from classes (shouldn't happen)
+            non_aloe_idx = -1
+            
+        if non_aloe_idx != -1:
+            non_aloe_prob = float(probs_np[non_aloe_idx])
+            aloe_indices  = [i for i in range(len(classes)) if i != non_aloe_idx]
+        else:
+            non_aloe_prob = 0.0
+            aloe_indices  = list(range(len(classes)))
+
+        aloe_probs = probs_np[aloe_indices]
+        
+        # Stage 1: Is it Aloe Vera?
+        if non_aloe_prob >= NON_ALOE_THRESHOLD:
+            label = "NON_ALOE"
+            confidence = non_aloe_prob
+        else:
+            # Stage 2: Best maturity
+            best_local = int(probs_np[aloe_indices].argmax())
+            label = classes[aloe_indices[best_local]]
+            confidence = float(aloe_probs[best_local])
+            
+            # Optional: handle uncertainty threshold if needed in future
+            # if confidence < UNCERTAINTY_THRESHOLD:
+            #     label = "UNCERTAIN_" + label
 
         raw = {classes[i]: round(float(p), 4) for i, p in enumerate(probs_np)}
-        logger.info(f"Prediction: {label} ({confidence:.4f}) | scores: {raw}")
+        logger.info(f"Prediction: {label} ({confidence:.4f}) | non_aloe_prob: {non_aloe_prob:.4f} | scores: {raw}")
 
         return label, confidence
 
