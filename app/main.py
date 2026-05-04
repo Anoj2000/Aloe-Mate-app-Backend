@@ -1,3 +1,13 @@
+import os
+import gc
+
+# ── Memory optimization for Render free tier ──────────────────────────────────
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
+import torch
+torch.set_num_threads(1)
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ExifTags
@@ -44,7 +54,7 @@ def get_exif_aware_dims(pil_image: Image.Image) -> tuple[int, int]:
     raw_w, raw_h = pil_image.size
 
     try:
-        exif = pil_image._getexif()          # None for PNG/WEBP or missing EXIF
+        exif = pil_image._getexif()
         if exif is None:
             return raw_w, raw_h
 
@@ -57,11 +67,11 @@ def get_exif_aware_dims(pil_image: Image.Image) -> tuple[int, int]:
 
         orientation = exif.get(orientation_tag)
         if orientation in (5, 6, 7, 8):
-            return raw_h, raw_w              # swap for 90°/270° rotations
+            return raw_h, raw_w
         return raw_w, raw_h
 
     except Exception:
-        return raw_w, raw_h                  # safe fallback — never crash
+        return raw_w, raw_h
 
 
 # ── Health endpoints ───────────────────────────────────────────────────────────
@@ -92,8 +102,11 @@ async def predict(
     cnn_bytes         = await cnn_image.read()
     cnn_cls, cnn_conf = predict_cnn(cnn_bytes)
 
+    # Free CNN image bytes from memory immediately
+    del cnn_bytes
+    gc.collect()
+
     # ── Step 2: Validation gate ───────────────────────────────────────────────
-    # If CNN identifies NON_ALOE, skip Geo entirely and return immediately.
     if cnn_cls == "NON_ALOE":
         return {
             "is_aloe_vera":     False,
@@ -110,31 +123,33 @@ async def predict(
     # ── Step 3: GEO branch (only runs when CNN confirms aloe vera) ────────────
     geo_bytes = await geo_image.read()
 
-    # Open BEFORE convert("RGB") so EXIF data is still intact for dim extraction.
     geo_pil_raw = Image.open(io.BytesIO(geo_bytes))
 
-    # Read visual dimensions from EXIF-aware helper BEFORE converting.
-    # Gallery photos stored as landscape buffers (e.g. 4032×3024) with EXIF
-    # orientation=6 must be swapped here so the Geo area formula uses the
-    # correct visual short-side as the normalisation base.
+    # Free geo bytes after opening image
+    del geo_bytes
+    gc.collect()
+
     w, h = get_exif_aware_dims(geo_pil_raw)
 
-    # Now safe to convert for any downstream pixel processing if needed.
-    geo_pil = geo_pil_raw.convert("RGB")  # noqa: F841 (kept for future use)
+    geo_pil = geo_pil_raw.convert("RGB")  # noqa: F841
 
     area     = geo_area_px2(roi_obj.r, w, h)
     geo_cls  = geo_class_from_area(area)
     geo_conf = geo_confidence(area)
 
+    # Free image from memory after geo calculation
+    del geo_pil_raw, geo_pil
+    gc.collect()
+
     print("====== GEO ALGORITHM DEBUG ======")
-    print(f"PIL Raw size (w, h) : {geo_pil_raw.size}")
+    print(f"PIL Raw size (w, h) : {w, h}")
     print(f"EXIF Aware (w, h)   : {(w, h)}")
     print(f"Frontend roi_r      : {roi_obj.r}")
     print(f"Calculated Area (px): {area}")
     print(f"Predicted Class     : {geo_cls}")
     print("=================================")
 
-    # ── Step 4: Compare CNN and Geo outputs separately ───────────────────────
+    # ── Step 4: Compare CNN and Geo outputs ───────────────────────────────────
     classes_match    = (cnn_cls == geo_cls)
     harvest_required = classes_match and cnn_cls == "MATURE"
     harvest_message: str | None = (

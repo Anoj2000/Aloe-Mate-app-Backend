@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import io
+import gc
 import json
 import logging
 import threading
@@ -28,7 +29,7 @@ def _get_device() -> str:
     global _device_str
     if _device_str is None:
         import torch
-        _device_str = "cuda" if torch.cuda.is_available() else "cpu"
+        _device_str = "cpu"  # Force CPU on Render free tier — no GPU available
         logger.info(f"Using device: {_device_str}")
     return _device_str
 
@@ -58,7 +59,7 @@ def _get_model():
             base        = tv_models.efficientnet_b0(weights=None)
             in_features = base.classifier[1].in_features   # 1280
 
-            # Must match training head exactly — no AdaptiveAvgPool2d or Flatten
+            # Must match training head exactly
             base.classifier = nn.Sequential(
                 nn.BatchNorm1d(in_features),
                 nn.Dropout(0.4),
@@ -76,6 +77,10 @@ def _get_model():
             base.load_state_dict(state_dict)
             base.to(device)
             base.eval()
+
+            # Free state_dict from memory after loading
+            del state_dict
+            gc.collect()
 
             _model = base
             logger.info("Model loaded and ready.")
@@ -120,23 +125,18 @@ def _get_classes() -> List[str]:
 
 # ── Transform ─────────────────────────────────────────────────────────────────
 
-def _build_transform(img_w: int, img_h: int):
+def _build_transform():
     """
-    Build inference transform that matches the training val_transform exactly:
-        Resize((224,224)) -> ToTensor() -> Normalize(ImageNet mean/std)
-
-    Now performs a CenterCrop on the shortest side to maintain a 1:1 aspect ratio,
-    since the frontend no longer crops the image itself.
+    Inference transform matching training val_transform exactly:
+        Resize(256) -> CenterCrop(224) -> ToTensor() -> Normalize(ImageNet mean/std)
     """
     import torchvision.transforms as T
-
-    norm = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     return T.Compose([
         T.Resize(256, interpolation=T.InterpolationMode.BILINEAR, antialias=True),
         T.CenterCrop(224),
         T.ToTensor(),
-        norm,
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
@@ -154,18 +154,27 @@ def predict_cnn(image_bytes: bytes) -> Tuple[str, float]:
         return "UNKNOWN", 0.0
 
     try:
-        device       = _get_device()
-        raw_img      = Image.open(io.BytesIO(image_bytes))
-        # FIX: Apply EXIF rotation before converting to RGB.
-        img          = ImageOps.exif_transpose(raw_img).convert("RGB")
+        device  = _get_device()
+        raw_img = Image.open(io.BytesIO(image_bytes))
+
+        # Apply EXIF rotation before converting to RGB
+        img = ImageOps.exif_transpose(raw_img).convert("RGB")
+
+        # Free raw image from memory
+        del raw_img
+        gc.collect()
+
         img_w, img_h = img.size
         logger.info(f"Input image size: {img_w}x{img_h}")
 
-        transform    = _build_transform(img_w, img_h)
-        tensor       = transform(img).unsqueeze(0).to(device)   # (1, 3, 224, 224)
+        transform = _build_transform()
+        tensor    = transform(img).unsqueeze(0).to(device)  # (1, 3, 224, 224)
 
-        # Prediction
+        # Free PIL image after tensor is built
+        del img
+        gc.collect()
 
+        # ── Prediction ────────────────────────────────────────────────────────
         model.eval()
         with torch.no_grad():
             logits = model(tensor)
@@ -174,18 +183,21 @@ def predict_cnn(image_bytes: bytes) -> Tuple[str, float]:
             probs = torch.nn.functional.softmax(logits[0], dim=0)
 
         probs_np = probs.cpu().numpy()
-        classes  = _get_classes()
-        
-        # ── Two-stage classification + threshold ──
+
+        # Free tensors from memory
+        del tensor, logits, probs
+        gc.collect()
+
+        classes = _get_classes()
+
+        # ── Two-stage classification ──────────────────────────────────────────
         NON_ALOE_THRESHOLD = 0.50
-        UNCERTAINTY_THRESHOLD = 0.35
 
         try:
             non_aloe_idx = classes.index("NON_ALOE")
         except ValueError:
-            # Fallback if NON_ALOE is missing from classes (shouldn't happen)
             non_aloe_idx = -1
-            
+
         if non_aloe_idx != -1:
             non_aloe_prob = float(probs_np[non_aloe_idx])
             aloe_indices  = [i for i in range(len(classes)) if i != non_aloe_idx]
@@ -194,23 +206,22 @@ def predict_cnn(image_bytes: bytes) -> Tuple[str, float]:
             aloe_indices  = list(range(len(classes)))
 
         aloe_probs = probs_np[aloe_indices]
-        
+
         # Stage 1: Is it Aloe Vera?
         if non_aloe_prob >= NON_ALOE_THRESHOLD:
-            label = "NON_ALOE"
+            label      = "NON_ALOE"
             confidence = non_aloe_prob
         else:
-            # Stage 2: Best maturity
+            # Stage 2: Best maturity class
             best_local = int(probs_np[aloe_indices].argmax())
-            label = classes[aloe_indices[best_local]]
+            label      = classes[aloe_indices[best_local]]
             confidence = float(aloe_probs[best_local])
-            
-            # Optional: handle uncertainty threshold if needed in future
-            # if confidence < UNCERTAINTY_THRESHOLD:
-            #     label = "UNCERTAIN_" + label
 
         raw = {classes[i]: round(float(p), 4) for i, p in enumerate(probs_np)}
-        logger.info(f"Prediction: {label} ({confidence:.4f}) | non_aloe_prob: {non_aloe_prob:.4f} | scores: {raw}")
+        logger.info(
+            f"Prediction: {label} ({confidence:.4f}) | "
+            f"non_aloe_prob: {non_aloe_prob:.4f} | scores: {raw}"
+        )
 
         return label, confidence
 
